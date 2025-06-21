@@ -1,0 +1,27 @@
+{
+  "functions": {
+    "source": "functions",
+    "runtime": "nodejs18",
+    "platform": "gcfv1",
+    "ignore": [
+      "node_modules",
+      ".git",
+      "firebase-debug.log",
+      "firebase-debug.*.log",
+      "*.local",
+      ".env*",
+      "*.env.*"
+    ],
+    "predeploy": [
+      "npm --prefix \"$RESOURCE_DIR\" run lint"
+    ]
+  },
+  "firestore": {
+    "database": "(default)",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  }
+}

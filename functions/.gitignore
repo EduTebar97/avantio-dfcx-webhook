@@ -1,0 +1,6 @@
+node_modules/
+*.local
+.env.gloove-chatbot-prod
+.env.diagflow-agent-332f7
+.env
+.env*

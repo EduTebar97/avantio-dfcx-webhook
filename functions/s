@@ -1,0 +1,2 @@
+firebase functions:config:set avantio.token="RzRV86mDe8h0EziTJzG5AzFN4TlbE7a1"
+firebase functions:config:set avantio.baseurl="https://api.avantio.pro/pms/v2"

@@ -9,12 +9,10 @@ const Fuse = require("fuse.js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- INICIALIZACIÓN GLOBAL ---
-// Inicializamos la app con la configuración para que el emulador funcione correctamente
 admin.initializeApp({
   projectId: "gloove-chatbot-prod",
   storageBucket: "gloove-chatbot-prod.appspot.com"
 });
-
 
 const db = admin.firestore();
 const storage = admin.storage().bucket();
@@ -23,22 +21,13 @@ const storage = admin.storage().bucket();
 const AVANTIO_AUTH_TOKEN = 'RzRV86mDe8h0EziTJzG5AzFN4TlbE7a1';
 const AVANTIO_API_BASE_URL = 'https://api.avantio.pro/pms/v2';
 
-
 // --- INICIO DE LA SECCIÓN DE PRUEBA RÁPIDA (INSEGURA) ---
-//
-//      ADVERTENCIA: NO USAR EN PRODUCCIÓN.
-//      La API Key está escrita directamente aquí para una prueba rápida.
-//      ¡RECUERDA QUITARLA ANTES DE TERMINAR!
-//
-const geminiApiKey = "AIzaSyCpo6IyOQwIXiVBGaKLpQbWdKwujhriSoI"; // <-- REEMPLAZA ESTO CON TU NUEVA CLAVE
-//
+const geminiApiKey = "AIzaSyCpo6IyOQwIXiVBGaKLpQbWdKwujhriSoI"; // <-- RECUERDA CAMBIAR ESTO POR LA LECTURA DE CONFIG DE FIREBASE
 // --- FIN DE LA SECCIÓN DE PRUEBA RÁPIDA ---
 
-
-// Inicialización del cliente de Gemini con la API Key escrita arriba
+// Inicialización del cliente de Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
 const generativeModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
 
 // --- FUNCIONES DE AYUDA (Sin cambios) ---
 function addTextMessage(messagesArray, text) {
@@ -48,17 +37,21 @@ function addSuggestionChips(messagesArray, chipsOptions) {
     messagesArray.push({ payload: { richContent: [[{ type: "chips", options: chipsOptions }]] } });
 }
 
-// --- WEBHOOK PRINCIPAL (Sin cambios en la lógica) ---
+// --- WEBHOOK PRINCIPAL ---
 exports.dialogflowWebhook = functions.https.onRequest(async (req, res) => {
     const startTime = Date.now();
     const tag = req.body.fulfillmentInfo?.tag;
-    console.log(`[+${Date.now() - startTime}ms] --- Webhook execution started. Tag: ${tag} ---`);
+    // --- NUEVO: Extraemos el ID de sesión para usarlo como clave ---
+    const sessionId = req.body.sessionInfo.session.split('/').pop();
+    
+    console.log(`[+${Date.now() - startTime}ms] --- Webhook execution started. Tag: ${tag}, Session: ${sessionId} ---`);
 
     const sessionParams = req.body.sessionInfo?.parameters || {};
     const messagesToSend = [];
     let updatedSessionParams = {};
 
     try {
+        // --- MODIFICADO: Lógica para construir el documento de sesión del alojamiento ---
         if (tag === "uc2_get_accommodation_details") {
             const nameInput = sessionParams.accommodation_name;
             if (!nameInput) {
@@ -83,41 +76,62 @@ exports.dialogflowWebhook = functions.https.onRequest(async (req, res) => {
                 if (!accId) {
                     addTextMessage(messagesToSend, `Lo siento, no he encontrado ningún alojamiento que se parezca a "${nameInput}".`);
                 } else {
-                    const response = await axios.get(`${AVANTIO_API_BASE_URL}/accommodations/${accId}`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 });
-                    const details = response.data.data;
-                    let context = `Nombre del alojamiento: ${details.name}. Tipo: ${details.type}. Ubicación: ${details.location.address}, ${details.location.cityName}. Capacidad: ${details.capacity.maxAdults} adultos. `;
-                    const hasPool = details.services.some(s => s.type === 'SWIMMING_POOL');
-                    context += `Piscina: ${hasPool ? 'Sí.' : 'No.'}. `;
-                    const hasWifi = details.services.some(s => s.type === 'INTERNET_ACCESS');
-                    context += `WiFi: ${hasWifi ? 'Sí.' : 'No.'}. `;
-                    updatedSessionParams.generative_context = context;
-                    updatedSessionParams.id_alojamiento_actual = accId;
+                    // --- NUEVO: Hacemos todas las llamadas a la API en paralelo ---
+                    console.log(`[+${Date.now() - startTime}ms] Fetching full document for accommodation ${accId}`);
+                    const [accommodationResponse, galleryResponse] = await Promise.all([
+                        axios.get(`${AVANTIO_API_BASE_URL}/accommodations/${accId}`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 }),
+                        axios.get(`${AVANTIO_API_BASE_URL}/accommodations/${accId}/gallery`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 })
+                    ]);
+
+                    const fullDocument = {
+                        type: 'ACCOMMODATION',
+                        details: accommodationResponse.data.data,
+                        gallery: galleryResponse.data.data,
+                        retrievedAt: new Date()
+                    };
+
+                    // --- NUEVO: Guardamos el documento completo en Firestore usando el ID de sesión ---
+                    await db.collection('active_sessions').doc(sessionId).set(fullDocument);
+                    console.log(`[+${Date.now() - startTime}ms] Session document saved for ${sessionId}`);
+                    
+                    // Ya no pasamos el `generative_context`. Solo un mensaje de saludo.
                     addTextMessage(messagesToSend, `¡Genial! Tengo la información sobre "${accName}". ¿En qué puedo ayudarte?`);
                 }
             }
         }
+        // --- MODIFICADO: Lógica para construir el documento de sesión de la reserva ---
         else if (tag === "uc3_get_booking_details") {
             const bookingId = sessionParams.booking_id;
             if (!bookingId) {
                 addTextMessage(messagesToSend, "Para ayudarte, necesito tu localizador o ID de reserva.");
             } else {
                 try {
-                    const { data: { data: b } } = await axios.get(`${AVANTIO_API_BASE_URL}/bookings/${bookingId}`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 });
-                    const accId = b.accommodation.id;
-                    const customer = `${b.customer.name} ${b.customer.surnames.join(" ")}`;
-                    const [{ data: { data: details } }, fileBuf] = await Promise.all([
+                    const { data: { data: bookingDetails } } = await axios.get(`${AVANTIO_API_BASE_URL}/bookings/${bookingId}`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 });
+                    
+                    const accId = bookingDetails.accommodation.id;
+                    const customer = `${bookingDetails.customer.name} ${bookingDetails.customer.surnames.join(" ")}`;
+                    
+                    console.log(`[+${Date.now() - startTime}ms] Fetching full document for booking ${bookingId}`);
+                    const [accommodationResponse, galleryResponse, instructionsFile] = await Promise.all([
                         axios.get(`${AVANTIO_API_BASE_URL}/accommodations/${accId}`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 }),
+                        axios.get(`${AVANTIO_API_BASE_URL}/accommodations/${accId}/gallery`, { headers: { "X-Avantio-Auth": AVANTIO_AUTH_TOKEN }, timeout: 15000 }),
                         storage.file(`${accId}.txt`).download().catch(() => null)
                     ]);
-                    const staticCtx = fileBuf ? fileBuf[0].toString('utf8') : "";
-                    let context = `Resumen de la reserva para ${customer} (ID: ${bookingId}):\n`;
-                    context += `- Fechas: Desde ${b.stayDates.arrival} hasta ${b.stayDates.departure}.\n`;
-                    context += `- Estado de la Reserva: ${b.status}.\n`;
-                    context += `- Alojamiento: ${details.name}, ubicado en ${details.location.cityName}.\n`;
-                    const hasPool = details.services.some(s => s.type === 'SWIMMING_POOL');
-                    context += `- El alojamiento tiene piscina: ${hasPool ? 'Sí.' : 'No.'}.\n`;
-                    if (staticCtx) context += `- Instrucciones Adicionales: ${staticCtx}`;
-                    updatedSessionParams.generative_context = context;
+
+                    const fullDocument = {
+                        type: 'BOOKING',
+                        booking: bookingDetails,
+                        details: accommodationResponse.data.data,
+                        gallery: galleryResponse.data.data,
+                        instructions: instructionsFile ? instructionsFile[0].toString('utf8') : "No hay instrucciones adicionales.",
+                        retrievedAt: new Date()
+                    };
+                    
+                    // --- NUEVO: Guardamos el documento completo en Firestore ---
+                    await db.collection('active_sessions').doc(sessionId).set(fullDocument);
+                    console.log(`[+${Date.now() - startTime}ms] Session document saved for ${sessionId}`);
+
+                    // Aún necesitamos estos parámetros para el siguiente paso del flujo
                     updatedSessionParams.booking_found = true;
                     updatedSessionParams.customer_name = customer;
                 } catch (err) {
@@ -125,6 +139,7 @@ exports.dialogflowWebhook = functions.https.onRequest(async (req, res) => {
                 }
             }
         }
+        // --- SIN CAMBIOS en los tags de apoyo ---
         else if (tag === "construir_mensaje_confirmacion") {
             if (!sessionParams.booking_found) {
                 addTextMessage(messagesToSend, "No encontré ninguna reserva con ese código. Por favor, verifícalo.");
@@ -138,15 +153,23 @@ exports.dialogflowWebhook = functions.https.onRequest(async (req, res) => {
             const cust = sessionParams.customer_name || "de nuevo";
             addTextMessage(messagesToSend, `¡Perfecto, ${cust}! Soy Gloovito. ¿En qué puedo ayudarte hoy sobre tu reserva?`);
         }
+        // --- MODIFICADO: El tag de IA ahora lee el documento de sesión de Firestore ---
         else if (tag === "generative_q_and_a") {
             const userQuery = req.body.text;
-            const context = sessionParams.generative_context;
-            if (!context) {
-                addTextMessage(messagesToSend, "Lo siento, no tengo un contexto sobre el cual responder.");
-            } else {
-                const prompt = `Eres Gloovito, un asistente virtual experto. Tu tarea es responder la PREGUNTA DEL USUARIO usando únicamente la información del CONTEXTO. Sé breve y amigable. Si la respuesta no está en el CONTEXTO, responde: "No dispongo de ese dato en concreto."\n\n---CONTEXTO:\n${context}\n\n---PREGUNTA DEL USUARIO:\n${userQuery}\n\n---RESPUESTA:`;
 
-                console.log(`[+${Date.now() - startTime}ms] Google AI Start: Calling generativeModel.generateContent`);
+            // --- NUEVO: Leemos el documento de la sesión actual desde Firestore ---
+            const sessionDoc = await db.collection('active_sessions').doc(sessionId).get();
+
+            if (!sessionDoc.exists) {
+                addTextMessage(messagesToSend, "Lo siento, parece que tu sesión ha expirado o no he encontrado información sobre un alojamiento. ¿Podrías indicarme sobre qué alojamiento o reserva quieres preguntar?");
+            } else {
+                const fullContextDocument = sessionDoc.data();
+                // Convertimos el objeto JSON completo en un string para que la IA lo pueda leer.
+                const contextForAI = JSON.stringify(fullContextDocument, null, 2);
+
+                const prompt = `Eres Gloovito, un asistente virtual experto en alquileres vacacionales. Tu tarea es responder la PREGUNTA DEL USUARIO usando únicamente la información del siguiente documento JSON en el CONTEXTO. Responde de forma amable y concisa. Si la información no está explícitamente en el documento, responde: "No dispongo de ese dato en concreto."\n\n---CONTEXTO (en formato JSON):\n${contextForAI}\n\n---PREGUNTA DEL USUARIO:\n${userQuery}\n\n---RESPUESTA:`;
+
+                console.log(`[+${Date.now() - startTime}ms] Google AI Start: Calling generativeModel.generateContent with full session document`);
 
                 const result = await generativeModel.generateContent(prompt);
                 const response = await result.response;

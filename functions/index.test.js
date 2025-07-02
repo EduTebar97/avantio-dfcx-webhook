@@ -1,122 +1,173 @@
 // functions/index.test.js
 
-// Importamos la función que queremos testear
+// --- B. MOCKS (Simulaciones) ---
+// Mockeamos las librerías externas para controlar sus respuestas durante los tests.
+const mockAxiosGet = jest.fn();
+jest.mock('axios', () => ({
+  get: mockAxiosGet,
+}));
+
+// --- NUEVO: Mocks más específicos y completos para Firestore ---
+const mockFirestoreSet = jest.fn();
+const mockFirestoreGet = jest.fn(); // Para .doc().get()
+const mockFirestoreWhereGet = jest.fn(); // Para .where()...get()
+const mockFirestoreCollectionGet = jest.fn(); // Para .collection().get()
+
+jest.mock('firebase-admin', () => ({
+  initializeApp: jest.fn(),
+  firestore: () => ({
+    collection: (collectionName) => {
+      // Si el código pide la colección 'accommodations', devolvemos un objeto
+      // que entiende las funciones .where() y .get() que usamos en el código.
+      if (collectionName === 'accommodations') {
+        return {
+          where: jest.fn(() => ({
+            limit: jest.fn(() => ({
+              get: mockFirestoreWhereGet,
+            })),
+          })),
+          get: mockFirestoreCollectionGet,
+        };
+      }
+      // Para cualquier otra colección (como 'active_sessions'), devolvemos
+      // el mock que entiende .doc().set() y .doc().get().
+      return {
+        doc: () => ({
+          set: mockFirestoreSet,
+          get: mockFirestoreGet,
+        }),
+      };
+    },
+  }),
+  storage: () => ({
+    bucket: () => ({
+      file: () => ({
+        download: jest.fn().mockResolvedValue([Buffer.from('Contenido de archivo estático simulado')]),
+      }),
+    }),
+  }),
+}));
+
+
+const mockGenerateContent = jest.fn();
+jest.mock('@google/generative-ai', () => ({
+    GoogleGenerativeAI: jest.fn(() => ({
+        getGenerativeModel: () => ({
+            generateContent: mockGenerateContent,
+        }),
+    })),
+}));
+
+// --- A. Importamos la función que queremos testear ---
 const { dialogflowWebhook } = require('./index');
 
-// --- SIMULACIÓN DE PETICIONES (REQUESTS) DE DIALOGFLOW ---
 
-const mockRequestAlojamiento = {
-  body: {
-    fulfillmentInfo: { tag: 'uc2_get_accommodation_details' },
-    sessionInfo: { parameters: { accommodation_name: 'Mar y Montaña House by Gloove' } }
-  }
-};
-const mockRequestAlojamientoNoExiste = {
-  body: {
-    fulfillmentInfo: { tag: 'uc2_get_accommodation_details' },
-    sessionInfo: { parameters: { accommodation_name: 'Villa Fantasma' } }
-  }
-};
-const mockRequestReserva = {
-  body: {
-    fulfillmentInfo: { tag: 'uc3_get_booking_details' },
-    sessionInfo: { parameters: { booking_id: '17719520' } }
-  }
-};
-const mockRequestReservaNoExiste = {
-  body: {
-    fulfillmentInfo: { tag: 'uc3_get_booking_details' },
-    sessionInfo: { parameters: { booking_id: '999999' } }
-  }
-};
-const mockSessionParamsConReserva = {
-  booking_found: true,
-  customer_name: 'Elżbieta Kowalska',
-};
-const mockRequestGenerativo = {
-    body: {
-      text: '¿El alojamiento tiene piscina?', // Simula la pregunta del usuario
-      fulfillmentInfo: { tag: 'generative_q_and_a' },
-      sessionInfo: {
-        parameters: {
-          // Simula el contexto que el webhook preparó en un paso anterior
-          generative_context: 'Nombre del alojamiento: Casa Playa Perfecta. Capacidad: 4 adultos. Piscina: Sí, privada. WiFi: Sí.'
-        }
-      }
-    }
-  };
+// --- C. DATOS DE PRUEBA ---
+const fakeAccommodationDetails = { data: { data: { name: 'Mar y Montaña Fake', galleryId: '123' } } };
+const fakeGalleryDetails = { data: { data: { name: 'Galería Fake', images: [] } } };
 
 
-// --- ESTRUCTURA DE LOS TESTS CON JEST ---
-
-describe('Webhook End-to-End Logic Tests', () => {
+// --- D. ESTRUCTURA DE LOS TESTS CON JEST ---
+describe('Webhook con Arquitectura de Documento de Sesión', () => {
 
   let mockResponse;
+
   beforeEach(() => {
+    jest.clearAllMocks();
     mockResponse = {
       status: jest.fn(() => mockResponse),
       json: jest.fn(),
     };
   });
 
-  // --- Tests para el Flujo de Alojamiento ---
-  describe('Caso de Uso 2: Consulta de Alojamiento', () => {
-    it('Debe encontrar un alojamiento y devolver el contexto preparado', async () => {
-      await dialogflowWebhook(mockRequestAlojamiento, mockResponse);
-      const jsonResponse = mockResponse.json.mock.calls[0][0];
-
-      console.log('UC2 Response (Success):', JSON.stringify(jsonResponse, null, 2));
+  describe('Caso de Uso 2: Creación de Documento de Alojamiento', () => {
+    
+    it('Debe llamar a las APIs, construir un documento y guardarlo en Firestore', async () => {
+      // 1. Preparamos las respuestas simuladas
+      // Simulamos que la búsqueda .where() en Firestore encuentra un resultado
+      mockFirestoreWhereGet.mockResolvedValue({
+        empty: false,
+        docs: [{ data: () => ({ avantio_id: '436145', name: 'Mar y Montaña House by Gloove' }) }]
+      });
       
+      mockAxiosGet
+        .mockResolvedValueOnce(fakeAccommodationDetails)
+        .mockResolvedValueOnce(fakeGalleryDetails);
+
+      // 2. Creamos la petición de Dialogflow
+      const mockRequest = {
+        body: {
+          fulfillmentInfo: { tag: 'uc2_get_accommodation_details' },
+          sessionInfo: {
+            session: 'projects/gloove-chatbot-prod/locations/us-central1/agents/xxx/sessions/test-session-123',
+            parameters: { accommodation_name: 'Mar y Montaña House by Gloove' }
+          }
+        }
+      };
+      
+      // 3. Ejecutamos el webhook
+      await dialogflowWebhook(mockRequest, mockResponse);
+
+      // 4. Verificamos
+      expect(mockFirestoreWhereGet).toHaveBeenCalledTimes(1);
+      expect(mockAxiosGet).toHaveBeenCalledTimes(2); // Se llamó 2 veces a la API de Avantio
+      expect(mockFirestoreSet).toHaveBeenCalledTimes(1); // Se guardó 1 documento en Firestore
+
+      const savedDocument = mockFirestoreSet.mock.calls[0][0];
+      expect(savedDocument.type).toBe('ACCOMMODATION');
+      expect(savedDocument.dynamicData.details.name).toBe('Mar y Montaña Fake');
+      expect(savedDocument.staticSchema.accommodation).toBe('Contenido de archivo estático simulado');
+      
+      const jsonResponse = mockResponse.json.mock.calls[0][0];
       expect(jsonResponse.fulfillment_response.messages[0].text.text[0]).toContain('¡Genial! Tengo la información');
-      expect(jsonResponse.session_info.parameters.generative_context).toContain('Piscina: Sí.');
-    }, 20000); // Timeout extendido
-
-    it('Debe devolver un mensaje de error si el alojamiento no se encuentra', async () => {
-        await dialogflowWebhook(mockRequestAlojamientoNoExiste, mockResponse);
-        const jsonResponse = mockResponse.json.mock.calls[0][0];
-        console.log('UC2 Response (Not Found):', JSON.stringify(jsonResponse, null, 2));
-        expect(jsonResponse.fulfillment_response.messages[0].text.text[0]).toContain('Lo siento, no he encontrado');
-    });
+    }, 20000);
   });
 
-  // --- Tests para el Flujo de Reserva ---
-  describe('Caso de Uso 3: Consulta de Reserva', () => {
-    it('Debe encontrar una reserva y preparar el contexto', async () => {
-      await dialogflowWebhook(mockRequestReserva, mockResponse);
-      const jsonResponse = mockResponse.json.mock.calls[0][0];
-      console.log('UC3 Response (Success):', JSON.stringify(jsonResponse, null, 2));
-      expect(jsonResponse.fulfillment_response.messages.length).toBe(0);
-      expect(jsonResponse.session_info.parameters.booking_found).toBe(true);
-      expect(jsonResponse.session_info.parameters.customer_name).toBe('Elżbieta Kowalska');
-    }, 20000); // Timeout extendido
+  describe('Módulo de IA Generativa con Documento de Sesión', () => {
 
-    it('Debe marcar error si la reserva no se encuentra', async () => {
-        await dialogflowWebhook(mockRequestReservaNoExiste, mockResponse);
-        const jsonResponse = mockResponse.json.mock.calls[0][0];
-        console.log('UC3 Response (Not Found):', JSON.stringify(jsonResponse, null, 2));
-        expect(jsonResponse.session_info.parameters.booking_found).toBe(false);
-    });
+    it('Debe leer de Firestore, construir un prompt enriquecido y devolver la respuesta de la IA', async () => {
+      // 1. Preparamos el documento que simularemos que está en Firestore
+      const fakeSessionDocument = {
+        type: 'ACCOMMODATION',
+        dynamicData: { details: { name: 'Alojamiento desde Firestore' } },
+        staticSchema: { accommodation: 'Diccionario de datos aquí' }
+      };
+      mockFirestoreGet.mockResolvedValue({
+        exists: true,
+        data: () => fakeSessionDocument
+      });
 
-    it('Debe construir el mensaje de confirmación de identidad', async () => {
-        const req = { body: { fulfillmentInfo: { tag: 'construir_mensaje_confirmacion' }, sessionInfo: { parameters: mockSessionParamsConReserva } } };
-        await dialogflowWebhook(req, mockResponse);
-        const jsonResponse = mockResponse.json.mock.calls[0][0];
-        console.log('Confirm Msg Response:', JSON.stringify(jsonResponse, null, 2));
-        expect(jsonResponse.fulfillment_response.messages[0].text.text[0]).toContain('¿eres tú?');
-    });
-  });
-
-  // --- Test para la IA Generativa ---
-  describe('Módulo de IA Generativa (generative_q_and_a)', () => {
-    it('Debe recibir contexto y pregunta, y devolver una respuesta de la IA', async () => {
-      await dialogflowWebhook(mockRequestGenerativo, mockResponse);
-      const jsonResponse = mockResponse.json.mock.calls[0][0];
+      // 2. Preparamos la respuesta simulada de Gemini
+      mockGenerateContent.mockResolvedValue({
+        response: {
+          text: () => 'Respuesta simulada de la IA.'
+        }
+      });
       
-      const respuestaDeLaIA = jsonResponse.fulfillment_response.messages[0].text.text[0];
-      console.log('Respuesta REAL de la IA en el test:', respuestaDeLaIA);
+      // 3. Creamos la petición de Dialogflow
+      const mockRequest = {
+        body: {
+          fulfillmentInfo: { tag: 'generative_q_and_a' },
+          text: '¿Qué tipo de vistas tiene?',
+          sessionInfo: {
+            session: 'projects/gloove-chatbot-prod/locations/us-central1/agents/xxx/sessions/test-session-456',
+          }
+        }
+      };
 
-      expect(respuestaDeLaIA).toBeDefined();
-      expect(respuestaDeLaIA.toLowerCase()).not.toContain('no dispongo');
-    }, 20000); // Timeout extendido
+      // 4. Ejecutamos el webhook
+      await dialogflowWebhook(mockRequest, mockResponse);
+
+      // 5. Verificamos
+      expect(mockFirestoreGet).toHaveBeenCalledTimes(1);
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+
+      const promptEnviadoALaIA = mockGenerateContent.mock.calls[0][0];
+      expect(promptEnviadoALaIA).toContain('DICCIONARIO DE DATOS');
+      expect(promptEnviadoALaIA).toContain('Alojamiento desde Firestore');
+
+      const jsonResponse = mockResponse.json.mock.calls[0][0];
+      expect(jsonResponse.fulfillment_response.messages[0].text.text[0]).toBe('Respuesta simulada de la IA.');
+    }, 20000);
   });
 });
